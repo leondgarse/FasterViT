@@ -11,8 +11,7 @@
 import torch
 import torch.nn as nn
 from timm.models.registry import register_model
-from timm.models.layers import trunc_normal_, DropPath, LayerNorm2d
-from .registry import register_model
+from timm.models.layers import trunc_normal_, DropPath, to_2tuple, LayerNorm2d
 import numpy as np
 
 
@@ -558,13 +557,13 @@ class WindowAttention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         # attention positional bias
         self.pos_emb_funct = PosEmbMLPSwinv2D(window_size=[resolution, resolution],
                                               pretrained_window_size=[resolution, resolution],
                                               num_heads=num_heads,
                                               seq_length=seq_length)
+        self.proj = nn.Linear(dim, dim)
 
         self.resolution = resolution
 
@@ -573,7 +572,9 @@ class WindowAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, -1, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
         attn = self.pos_emb_funct(attn, self.resolution ** 2)
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, -1, C)
@@ -624,14 +625,34 @@ class HAT(nn.Module):
             ct_size: spatial dimension of carrier token local window.
             do_propagation: enable carrier token propagation.
         """
+        cr_tokens_per_window = ct_size**2 if sr_ratio > 1 else 0
+        cr_tokens_total = cr_tokens_per_window*sr_ratio*sr_ratio
+        self.cr_window = ct_size
+        self.sr_ratio = sr_ratio
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        use_layer_scale = layer_scale is not None and type(layer_scale) in [int, float]
+        if sr_ratio > 1:
+            # if do hierarchical attention, this part is for carrier tokens
+            self.hat_pos_embed = PosEmbMLPSwinv1D(dim, rank=2, seq_length=cr_tokens_total)
+            self.hat_norm1 = norm_layer(dim)
+            self.hat_attn = WindowAttention(
+                dim,
+                num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop, resolution=int(cr_tokens_total**0.5),
+                seq_length=cr_tokens_total)
+
+            self.hat_norm2 = norm_layer(dim)
+            self.hat_mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+            self.hat_drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+            self.gamma1 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
+            self.gamma2 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
+            self.upsampler = nn.Upsample(size=window_size, mode='nearest')
+
         # positional encoding for windowed attention tokens
         self.pos_embed = PosEmbMLPSwinv1D(dim, rank=2, seq_length=window_size**2)
         self.norm1 = norm_layer(dim)
         # number of carrier tokens per every window
-        cr_tokens_per_window = ct_size**2 if sr_ratio > 1 else 0
         # total number of carrier tokens
-        cr_tokens_total = cr_tokens_per_window*sr_ratio*sr_ratio
-        self.cr_window = ct_size
         self.attn = WindowAttention(dim,
                                     num_heads=num_heads,
                                     qkv_bias=qkv_bias,
@@ -643,31 +664,12 @@ class HAT(nn.Module):
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.window_size = window_size
 
-        use_layer_scale = layer_scale is not None and type(layer_scale) in [int, float]
         self.gamma3 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
         self.gamma4 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
 
-        self.sr_ratio = sr_ratio
-        if sr_ratio > 1:
-            # if do hierarchical attention, this part is for carrier tokens
-            self.hat_norm1 = norm_layer(dim)
-            self.hat_norm2 = norm_layer(dim)
-            self.hat_attn = WindowAttention(
-                dim,
-                num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                attn_drop=attn_drop, proj_drop=drop, resolution=int(cr_tokens_total**0.5),
-                seq_length=cr_tokens_total)
-
-            self.hat_mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-            self.hat_drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-            self.hat_pos_embed = PosEmbMLPSwinv1D(dim, rank=2, seq_length=cr_tokens_total)
-            self.gamma1 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
-            self.gamma2 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
-            self.upsampler = nn.Upsample(size=window_size, mode='nearest')
 
         # keep track for the last block to explicitly add carrier tokens to feature maps
         self.last = last
@@ -711,7 +713,9 @@ class HAT(nn.Module):
             if self.last and self.do_propagation:
                 # propagate carrier token information into the image
                 ctr_image_space = ctr.transpose(1, 2).reshape(B, N, self.cr_window, self.cr_window)
-                x = x + self.gamma1 * self.upsampler(ctr_image_space.to(dtype=torch.float32)).flatten(2).transpose(1, 2).to(dtype=x.dtype)
+                cc = self.upsampler(ctr_image_space.to(dtype=torch.float32)).flatten(2).transpose(1, 2).to(dtype=x.dtype)
+                print(f"{self.cr_window = }, {self.window_size = }, {x.shape = }, {ctr.shape = }, {cc.shape = }")
+                x = x + self.gamma1 * cc
         return x, ct
 
 
@@ -743,10 +747,12 @@ class TokenInitializer(nn.Module):
         to_global_feature.add_module("pool", nn.AvgPool2d(kernel_size=kernel_size, stride=stride_size))
         self.to_global_feature = to_global_feature
         self.window_size = ct_size
+        print(f'{output_size = }, {stride_size = }, {kernel_size = }, {ct_size = }')
 
     def forward(self, x):
         x = self.to_global_feature(x)
-        B, C, H, W = x.shape
+        print(f"{x.shape = }")
+        B, C, W, H = x.shape
         ct = x.view(B, C, H // self.window_size, self.window_size, W // self.window_size, self.window_size)
         ct = ct.permute(0, 2, 4, 3, 5, 1).reshape(-1, H*W, C)
         return ct
@@ -804,6 +810,15 @@ class FasterViTLayer(nn.Module):
         super().__init__()
         self.conv = conv
         self.transformer_block = False
+        if not only_local and input_resolution // window_size > 1 and hierarchy and not self.conv:
+            print("Adding global_tokenizer")
+            self.global_tokenizer = TokenInitializer(dim,
+                                                     input_resolution,
+                                                     window_size,
+                                                     ct_size=ct_size)
+            self.do_gt = True
+        else:
+            self.do_gt = False
         if conv:
             self.blocks = nn.ModuleList([
                 ConvBlock(dim=dim,
@@ -832,14 +847,7 @@ class FasterViTLayer(nn.Module):
                 for i in range(depth)])
             self.transformer_block = True
         self.downsample = None if not downsample else Downsample(dim=dim)
-        if len(self.blocks) and not only_local and input_resolution // window_size > 1 and hierarchy and not self.conv:
-            self.global_tokenizer = TokenInitializer(dim,
-                                                     input_resolution,
-                                                     window_size,
-                                                     ct_size=ct_size)
-            self.do_gt = True
-        else:
-            self.do_gt = False
+        print(f'{input_resolution = }, {window_size = }')
 
         self.window_size = window_size
 
@@ -977,22 +985,15 @@ class FasterViT(nn.Module):
 
 @register_model
 def faster_vit_0_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [2, 3, 6, 5])
-    num_heads = kwargs.pop("num_heads", [2, 4, 8, 16])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 64)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.2)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[2, 3, 6, 5],
+                      num_heads=[2, 4, 8, 16],
+                      window_size=[8, 8, 7, 7],
+                      ct_size=2,
+                      dim=64,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
                       **kwargs)
@@ -1004,22 +1005,15 @@ def faster_vit_0_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_1_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [1, 3, 8, 5])
-    num_heads = kwargs.pop("num_heads", [2, 4, 8, 16])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 80)
-    in_dim = kwargs.pop("in_dim", 32)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.2)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[1, 3, 8, 5],
+                      num_heads=[2, 4, 8, 16],
+                      window_size=[8, 8, 7, 7],
+                      ct_size=2,
+                      dim=80,
+                      in_dim=32,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
                       **kwargs)
@@ -1031,22 +1025,15 @@ def faster_vit_1_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_2_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [3, 3, 8, 5])
-    num_heads = kwargs.pop("num_heads", [2, 4, 8, 16])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 96)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.2)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[3, 3, 8, 5],
+                      num_heads=[2, 4, 8, 16],
+                      window_size=[8, 8, 7, 7],
+                      ct_size=2,
+                      dim=96,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
                       **kwargs)
@@ -1058,26 +1045,18 @@ def faster_vit_2_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_3_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [3, 3, 12, 5])
-    num_heads = kwargs.pop("num_heads", [2, 4, 8, 16])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 128)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.3)
-    layer_scale = kwargs.pop("layer_scale", 1e-5)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[3, 3, 12, 5],
+                      num_heads=[2, 4, 8, 16],
+                      window_size=[7, 7, 7, 7],
+                      ct_size=2,
+                      dim=128,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
-                      layer_scale=layer_scale,
+                      layer_scale=1e-5,
                       layer_scale_conv=None,
                       do_propagation=True,
                       **kwargs)
@@ -1089,26 +1068,18 @@ def faster_vit_3_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_4_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [3, 3, 12, 5])
-    num_heads = kwargs.pop("num_heads", [2, 4, 8, 16])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 196)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.3)
-    layer_scale = kwargs.pop("layer_scale", 1e-5)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[3, 3, 12, 5],
+                      num_heads=[4, 8, 16, 32],
+                      window_size=[7, 7, 7, 7],
+                      ct_size=2,
+                      dim=196,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
-                      layer_scale=layer_scale,
+                      layer_scale=1e-5,
                       layer_scale_conv=None,
                       layer_norm_last=False,
                       do_propagation=True,
@@ -1121,26 +1092,18 @@ def faster_vit_4_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_5_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [3, 3, 12, 5])
-    num_heads = kwargs.pop("num_heads", [4, 8, 16, 32])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 320)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.3)
-    layer_scale = kwargs.pop("layer_scale", 1e-5)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[3, 3, 12, 5],
+                      num_heads=[4, 8, 16, 32],
+                      window_size=[7, 7, 7, 7],
+                      ct_size=2,
+                      dim=320,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
-                      layer_scale=layer_scale,
+                      layer_scale=1e-5,
                       layer_scale_conv=None,
                       layer_norm_last=False,
                       do_propagation=True,
@@ -1153,26 +1116,18 @@ def faster_vit_5_224(pretrained=False, **kwargs):
 
 @register_model
 def faster_vit_6_224(pretrained=False, **kwargs):
-    depths = kwargs.pop("depths", [3, 3, 16, 8])
-    num_heads = kwargs.pop("num_heads", [4, 8, 16, 32])
-    window_size = kwargs.pop("window_size", [7, 7, 7, 7])
-    ct_size = kwargs.pop("ct_size", 2)
-    dim = kwargs.pop("dim", 320)
-    in_dim = kwargs.pop("in_dim", 64)
-    mlp_ratio = kwargs.pop("mlp_ratio", 4)
-    resolution = kwargs.pop("resolution", 224)
     drop_path_rate = kwargs.pop("drop_path_rate", 0.5)
-    layer_scale = kwargs.pop("layer_scale", 1e-5)
-    model = FasterViT(depths=depths,
-                      num_heads=num_heads,
-                      window_size=window_size,
-                      ct_size=ct_size,
-                      dim=dim,
-                      in_dim=in_dim,
-                      mlp_ratio=mlp_ratio,
+    resolution = kwargs.pop("resolution", 224)
+    model = FasterViT(depths=[3, 3, 16, 8],
+                      num_heads=[4, 8, 16, 32],
+                      window_size=[7, 7, 7, 7],
+                      ct_size=2,
+                      dim=320,
+                      in_dim=64,
+                      mlp_ratio=4,
                       resolution=resolution,
                       drop_path_rate=drop_path_rate,
-                      layer_scale=layer_scale,
+                      layer_scale=1e-5,
                       layer_scale_conv=None,
                       layer_norm_last=False,
                       do_propagation=True,
